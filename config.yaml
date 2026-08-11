@@ -1,0 +1,35 @@
+# LiteLLM gateway — every model call in the stack transits this.
+#
+# CONFIG POLICY: anything that changes WHAT IS ALLOWED (models, budgets, rate limits) lives
+# in this file, under review. Only operational actions — issuing or revoking a virtual key,
+# an emergency budget bump, viewing spend — happen in the LiteLLM portal. A budget widened by
+# a click leaves no diff and no reviewer, and LiteLLM's own audit log is an enterprise feature;
+# git gives it free.
+#
+# The names on the left are ALIASES. Nothing in UniStack ever names a raw model id, so
+# swapping provider or model is a one-line change here with no code touched.
+
+model_list:
+  - model_name: agent-primary            # what the graph's nodes ask for
+    litellm_params:
+      model: anthropic/claude-sonnet-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  - model_name: judge-fast               # what the guardrail judge asks for
+    litellm_params:
+      model: anthropic/claude-haiku-4-5-20251001
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+litellm_settings:
+  # MUST stay empty. The UniStack SDK already writes the LLM spans to Langfuse; LiteLLM's
+  # own logging would emit the same generations a second time, doubling every call and its
+  # cost in exactly the data the projector reads (BUILD_PLAN item 7).
+  callbacks: []
+
+  # A backstop only. Real enforcement is per-virtual-key (`max_budget` at key creation), so
+  # one runaway workflow cannot spend another team's allowance.
+  max_budget: 20.0
+  budget_duration: 30d
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
