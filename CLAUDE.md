@@ -93,8 +93,16 @@ curl -s -H "Authorization: Bearer $LITELLM_MASTER_KEY" \
   "localhost:4000/spend/logs" | python3 -m json.tool | head -40
 ```
 
-Each row carries the `metadata` UniStack attaches — `activity_id`, `workflow`, `node` — so spend
-is attributable per activity, not just per key.
+Each row carries the model, the virtual key, token counts and the computed cost. This is the
+**authoritative billing number** — it is what budget enforcement acts on.
+
+> **Spend here is per key and per model, not per activity.** The SDK does send `activity_id` /
+> `workflow` / `node` as request metadata, but it does not surface in `/spend/logs` on this
+> LiteLLM build (tested two request shapes; calls bill correctly, the tag just is not
+> queryable). **Per-activity cost comes from Langfuse instead**, which already groups every span
+> by `session.id = activity_id` — see BUILD_PLAN.md, "Activity cost". Treat the two numbers as
+> answering different questions and never sum them: Langfuse estimates what an activity cost,
+> LiteLLM records what a key actually spent.
 
 ## Files
 
