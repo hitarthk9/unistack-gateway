@@ -33,12 +33,131 @@ dependency on one particular gateway product. So the split is:
 
 ## Two rules that are easy to break
 
-1. **`litellm_settings.callbacks` MUST stay empty.** The UniStack SDK already writes LLM spans
-   to Langfuse. LiteLLM logging the same calls would emit every generation twice, doubling
-   spend and token counts in exactly the data the projector reads (BUILD_PLAN item 7).
+1. **No GENERATION logger in `litellm_settings.callbacks`.** The UniStack SDK already writes
+   LLM spans to Langfuse; a second writer would emit every generation twice, doubling spend and
+   token counts in exactly the data the projector reads (BUILD_PLAN item 7).
+
+   *This used to read "the list MUST stay empty", which was too strong.* `security_sink.sink`
+   is the **one permitted entry**: it writes only guardrail findings to
+   `unistack.security_events`, and on a clean call it writes nothing at all — verified, a full
+   guarded activity produces zero documents and exactly two Langfuse generations. Adding any
+   **other** entry requires making that argument again from scratch.
 2. **Use the OpenAI-compatible route (`/v1`), never the Anthropic passthrough**
    (`/anthropic/v1/messages`). LiteLLM does not reliably meter spend or enforce budgets on
    passthrough — you would get a model allow-list and nothing else.
+
+## The security layer (BUILD_PLAN item 5)
+
+Deterministic only — **nothing here calls an LLM.** The LLM security judge is item 6 and runs
+forensically on completed traces, never in the request path.
+
+| Guardrail | Does | Records a finding? |
+|---|---|---|
+| `unistack-secrets` (`UniStackSecrets`) | Masks credentials outbound, `pre_call` | **Yes** — type + count, never the value |
+| `unistack-no-code-exec` (`block_code_execution`) | Blocks code-execution requests | Yes |
+| `unistack-red-lines` (`litellm_content_filter`) | Blocks self-harm + illegal-weapons | Yes |
+
+All three are `default_on: false` in config and **selected per request by model** — see the
+judge exemption below. That is deliberate, not disabled.
+
+**`unistack-secrets` is ours, not stock.** `hide-secrets` masks but records nothing, so a
+redacted leak was invisible — the platform could never answer *"did a credential leak in this
+activity?"*. `UniStackSecrets` subclasses it, reuses its ~200 `detect_secrets` plugins, and
+records the finding. It stores the secret's **type and count, never its value**: an audit log
+that quotes the credential it just redacted has leaked it into a second store.
+
+**`unistack-no-code-exec` is the one domain-dependent choice here.** A *coding* agent must drop
+it from `_BLOCKING` in `unistack_security.py` — its normal traffic is exactly what this blocks.
+
+**Why so few content categories.** Two reasons, and the second was measured.
+
+*Policy categories are the wrong tool here.* The filter also ships `bias_*`,
+`denied_medical_advice`, `denied_legal_advice` and `claims_*`. Those encode **client-specific
+business policy**, and UniStack already has a mechanism for that — the business-policy guard,
+which judges node output against a policy string and pauses a **human**. A gateway keyword rule
+would be a second, dumber copy of an existing control, in the one place where a false positive
+kills the request instead of asking someone.
+
+⚠️ *`harm_toxic_abuse` and `harmful_child_safety` are excluded because they are broken for
+general use.* Their obfuscated-profanity patterns (e.g. `sh*i*t`, where `*` is a wildcard) match
+ordinary English. Measured: **"This shift is a great insight for your workflow."** and **"A
+standing desk helps you shift posture through it."** were both BLOCKED — 2 of 4 innocuous
+business sentences. `harmful_child_safety` inherits the same list via
+`inherit_from: harm_toxic_abuse.json`. A rule that rejects half of normal copy is not a security
+control. `severity_threshold` is `high` for the same reason. **Re-run that four-sentence probe
+before enabling any new category.**
+
+**Why the prompt-injection categories are still off.** The judge is now exempt from blocking
+rules, so they no longer endanger it — but they remain unproven against *agent* traffic, and the
+two categories removed above are a warning about how loose these pattern sets can be. They stay
+deferred to the kill-switch / egress item, where they get the same four-sentence probe before
+being enabled.
+
+### Two blind spots to state plainly
+
+- **Masking does not protect the trace.** The SDK writes `input.value` to Langfuse *before* the
+  gateway masks anything, so a secret redacted here is still in Langfuse in cleartext. Gateway
+  masking protects the *provider*, not the *trace*. (The finding itself is recorded — that was
+  fixed by `UniStackSecrets` — but the redaction only applies downstream of the SDK.)
+- **This sees model calls, not the agent.** A node that calls an API directly never transits the
+  gateway. Read "0 findings" as *"nothing in the model traffic was flagged"*, never as
+  *"nothing left the process"*.
+
+### The judge is exempt from blocking rules — and why that is not optional
+
+The SDK's guardrail judge transits this gateway too, and **its prompt embeds the agent's raw
+output**. So a content rule ends up inspecting exactly the quarantined material it is looking
+for. Observed live before the fix: a rule matched inside a judge prompt, the call was blocked,
+`evaluate_guardrail` **failed closed**, and the activity paused with *"guardrail judge
+unavailable"* — pointing the operator at the wrong subsystem entirely.
+
+LiteLLM's own answer is per-key scoping, and **both mechanisms are Enterprise-gated**
+(`disable_global_guardrails` and per-key `guardrails`). Since Enterprise is permanently out of
+scope, the free-tier equivalent lives in `unistack_security.py`: every guardrail is
+`default_on: false`, and `SecuritySink.async_pre_call_hook` selects them per request by model.
+
+| Traffic | Secrets masking (non-blocking) | Blocking rules |
+|---|---|---|
+| Agent models | ✅ | ✅ |
+| `judge-fast` (the control plane) | ✅ | ❌ **never** |
+
+The split is the principle, not a workaround: **non-blocking hygiene applies everywhere; a
+blocking rule must never be able to stop the control plane.** Masking still runs on the judge
+because redacting a credential it does not need is harmless and the finding is still recorded —
+so a leak in agent output is caught even when it surfaces on the judge's call.
+
+Two properties the hook must keep, both covered by the verification below:
+
+- It **overwrites** `data["guardrails"]` unconditionally and never honours a caller-supplied
+  value. LiteLLM checks the request body first, so merging would let any caller disable every
+  guardrail with `{"guardrails": []}`.
+- On any internal error it applies the **full** set. The worst case is a visible judge pause,
+  never silently ungated agent traffic.
+
+Change the exempt models with `UNISTACK_GUARDRAIL_EXEMPT_MODELS` (default `judge-fast`); the
+resolved list is printed in the startup line so it is visible at boot rather than inferred.
+
+> Because the judge is exempt, a **code-generating agent no longer breaks its own judge**. Such
+> an agent still needs `unistack-no-code-exec` removed from `_BLOCKING`, since its own traffic
+> is what that rule blocks.
+
+### How findings get out — and the trap in it
+
+`unistack_security.py` reads findings off the request and posts them to `unistack-api`, which
+owns MongoDB. Two things about it are non-obvious and were both found the hard way:
+
+1. It hooks `async_post_call_success_hook` / `async_post_call_failure_hook`, **not**
+   `async_log_success_event`. A guardrail that blocks short-circuits the request and fires
+   *neither* logging callback — a sink built on those records clean calls and misses every block.
+2. It reads **both** `metadata` and `litellm_metadata`. `block_code_execution` writes findings to
+   the first, `litellm_content_filter` to the second. Reading one bucket silently loses every
+   finding from the other, and looks exactly like "the guardrail never fired".
+
+**Why HTTP rather than a direct Mongo write:** the stock image ships no Mongo driver *and no
+pip* (it is built with uv), so writing to Mongo directly requires a custom image — turning
+`docker run` into `docker build` first. `httpx` is already present, so posting to the service
+that already owns the database keeps this on the **stock image with two volume mounts**. It also
+keeps Mongo credentials out of a container that holds provider API keys.
 
 ## Config policy
 
@@ -59,14 +178,33 @@ docker run -d --name unistack-litellm-db \
   -e POSTGRES_USER=litellm -e POSTGRES_PASSWORD=litellm -e POSTGRES_DB=litellm \
   -p 5432:5432 postgres:16
 
-# 2. The gateway
+# 2. The gateway — STOCK image, no build. Two mounts: the config and the security module.
+#    Both are mounted, so a guardrail change or a sink change is an edit plus a restart.
+#    Note host paths must be host.docker.internal from inside the container, not localhost.
 docker run -d --name unistack-litellm -p 4000:4000 \
   -v "$PWD/config.yaml:/app/config.yaml" \
+  -v "$PWD/unistack_security.py:/app/unistack_security.py:ro" \
   -e ANTHROPIC_API_KEY -e LITELLM_MASTER_KEY \
-  -e DATABASE_URL=postgresql://litellm:litellm@host.docker.internal:5432/litellm \
+  -e DATABASE_URL="${DATABASE_URL/localhost/host.docker.internal}" \
+  -e UNISTACK_API_URL=http://host.docker.internal:8001 \
+  -e UNISTACK_API_TOKEN="$UNISTACK_API_TOKEN" \
   ghcr.io/berriai/litellm:main-latest --config /app/config.yaml --port 4000
 
 curl -s localhost:4000/health/liveliness      # -> "I'm alive!"
+
+# ALWAYS check this after a restart. A typo in `callbacks:` makes LiteLLM skip the sink
+# SILENTLY — this line is the only cheap proof it loaded.
+docker logs unistack-litellm 2>&1 | grep unistack-security
+# -> [unistack-security] sink v2 loaded (api=http://host.docker.internal:8001, token=set)
+```
+
+### Check what the guardrails caught
+
+```bash
+mongosh --quiet --eval '
+  db.getSiblingDB("unistack").security_events.find({source:"gateway"})
+    .sort({detected_at:-1}).limit(5).forEach(d => print(d.action + "  " + d.reason))'
+# -> block  unistack-red-lines block — harmful_illegal_weapons: 'ghost gun'
 ```
 
 Portal: <http://localhost:4000/ui> (log in with the master key).
@@ -107,6 +245,11 @@ Each row carries the model, the virtual key, token counts and the computed cost.
 ## Files
 
 ```
-config.yaml     ← the model catalogue, aliases, budgets. The reviewed source of truth
-.env.example    ← provider keys + master key + DATABASE_URL (never committed with real values)
+config.yaml           ← models, aliases, budgets, guardrails. The reviewed source of truth
+unistack_security.py  ← the recording secrets guardrail + the findings sink
+.env.example          ← provider keys, master key, DATABASE_URL, UNISTACK_API_* (no real values)
 ```
+
+**No Dockerfile, by design.** Both files are mounted into the stock image, so the gateway stays
+`docker run` — no build step, and nothing to rebuild when a rule changes. That is only possible
+because the sink posts findings over HTTP instead of writing Mongo directly; see above.

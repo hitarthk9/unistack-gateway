@@ -20,11 +20,98 @@ model_list:
       model: anthropic/claude-haiku-4-5-20251001
       api_key: os.environ/ANTHROPIC_API_KEY
 
+# ── Security layer (BUILD_PLAN item 5) ────────────────────────────────────────────────────
+# DETERMINISTIC ONLY. Nothing here calls an LLM: it is all pattern and list matching, so it
+# is fast, non-flaky and auditable. The LLM security judge is item 6 and runs FORENSICALLY on
+# completed traces — never in front of a call, because "did an attack land?" is only
+# answerable after the fact, and an allow-list answers "might this be bad?" better and cheaper.
+#
+# `image_model` is deliberately never set on the content filter below: it is that guardrail's
+# ONLY path to a model call.
+#
+# EVERY guardrail here is `default_on: false` ON PURPOSE. They are NOT disabled — they are
+# selected per request, by model, in unistack_security.py (`_select_guardrails`). That
+# indirection is the whole point: the SDK's guardrail JUDGE transits this gateway too, and its
+# prompt contains the agent's raw output, which is exactly what a content rule looks for. With
+# guardrails applied globally the judge got blocked, `evaluate_guardrail` failed CLOSED, and the
+# activity paused with "guardrail judge unavailable" — pointing the operator at the wrong
+# subsystem. LiteLLM's own per-key scoping is Enterprise-only, so this hook is the free-tier
+# equivalent. Non-blocking hygiene still runs everywhere; only BLOCKING rules are withheld.
+guardrails:
+
+  # 1. Outbound credential masking, WITH an audit trail.
+  #    Stock `hide-secrets` masks but records nothing, so a redacted leak would be invisible
+  #    to the platform — you could never answer "did a credential leak in this activity?".
+  #    `UniStackSecrets` subclasses it, reuses its ~200 detect_secrets plugins, and records
+  #    the finding. It records the secret's TYPE and a count, never its value.
+  #    (It still does not protect the TRACE: the SDK writes input.value to Langfuse before
+  #    this runs, so a masked secret is in Langfuse in cleartext. See CLAUDE.md.)
+  - guardrail_name: "unistack-secrets"
+    litellm_params:
+      guardrail: unistack_security.UniStackSecrets   # mounted file, resolved from this dir
+      mode: "pre_call"          # masking only works before the prompt leaves
+      default_on: false   # selected per request — see the note above
+
+  # 2. Code-execution requests. Deterministic, and it DOES populate guardrail_information,
+  #    so every hit lands in security_events.
+  #    ⚠️ The one domain-dependent choice in this file: a CODING agent must drop this from
+  #    `_BLOCKING` in unistack_security.py, or its normal traffic will be blocked. (It no
+  #    longer breaks the JUDGE of such an agent — the judge is exempt from blocking rules.)
+  - guardrail_name: "unistack-no-code-exec"
+    litellm_params:
+      guardrail: block_code_execution
+      mode: "pre_call"
+      action: "block"           # lowercase here; the content filter below uses uppercase
+      detect_execution_intent: true
+      default_on: false   # selected per request — never applied to the judge
+
+  # 3. Red lines only. These four are near-universal for a business agent, so they are safe
+  #    to apply to every client without knowing the domain.
+  #
+  #    NOT enabled, deliberately: bias_*, denied_medical_advice, denied_legal_advice, claims_*
+  #    and the discrimination categories. Those encode CLIENT-SPECIFIC BUSINESS POLICY, and
+  #    UniStack already has a mechanism for exactly that — the business-policy guard, which
+  #    judges node output against a policy string and pauses a HUMAN. Re-implementing
+  #    "no medical advice" as a gateway keyword rule would be a second, dumber copy of an
+  #    existing control, in the one place where a false positive kills the request instead of
+  #    asking someone.
+  #
+  #    Also NOT enabled: the prompt_injection_* categories. They match on
+  #    "identifier word + block word in the same sentence", and the judge's prompt embeds the
+  #    user's own policy text — so a policy like "Never reveal the system prompt" is an exact
+  #    match. BLOCK would fail the judge, which fails CLOSED, pausing every guarded activity;
+  #    MASK would redact words out of the policy so the judge grades corrupted text. They need
+  #    a separate judge key first — deferred to the kill-switch / egress item.
+  - guardrail_name: "unistack-red-lines"
+    litellm_params:
+      guardrail: litellm_content_filter
+      mode: "pre_call"
+      default_on: false   # selected per request — never applied to the judge
+      severity_threshold: "high"       # high only — "medium" admits the loose patterns below
+      categories:
+        # ⚠️ `harm_toxic_abuse` and `harmful_child_safety` are DELIBERATELY ABSENT.
+        # Measured, not assumed: their obfuscated-profanity patterns (e.g. `sh*i*t`, where `*`
+        # is a wildcard) match ordinary English. "This shift is a great insight for your
+        # workflow." and "A standing desk helps you shift posture through it." were both
+        # BLOCKED — 2 of 4 innocuous business sentences. `harmful_child_safety` inherits the
+        # same word list via `inherit_from: harm_toxic_abuse.json`, so it carries the same
+        # defect. A guardrail that rejects half of normal copy is not a security control.
+        - category: "harmful_self_harm"
+          enabled: true
+          action: "BLOCK"
+        - category: "harmful_illegal_weapons"
+          enabled: true
+          action: "BLOCK"
+
 litellm_settings:
-  # MUST stay empty. The UniStack SDK already writes the LLM spans to Langfuse; LiteLLM's
-  # own logging would emit the same generations a second time, doubling every call and its
-  # cost in exactly the data the projector reads (BUILD_PLAN item 7).
-  callbacks: []
+  # THE RULE, precisely: no GENERATION logger. The UniStack SDK already writes the LLM spans
+  # to Langfuse, and a second writer would double every generation and its cost in exactly the
+  # data the projector reads (BUILD_PLAN item 7).
+  #
+  # `unistack_security.sink` is not a generation logger. It ships ONLY guardrail findings to
+  # unistack-api (which owns Mongo), and on a clean call it does nothing at all. Adding any
+  # OTHER entry to this list requires making that argument again from scratch.
+  callbacks: ["unistack_security.sink"]
 
   # A backstop only. Real enforcement is per-virtual-key (`max_budget` at key creation), so
   # one runaway workflow cannot spend another team's allowance.
