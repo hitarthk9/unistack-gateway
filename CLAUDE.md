@@ -13,7 +13,7 @@ dependency on one particular gateway product. So the split is:
 |---|---|
 | `unistack-sdk` | An **OpenAI-compatible endpoint**. Takes `llm_base_url` + `llm_api_key`, nothing more. Zero LiteLLM references — swap the gateway and the SDK is unchanged. |
 | **`unistack-gateway`** (here) | LiteLLM: models, aliases, budgets, keys, deployment. |
-| `unistack-agents` | Points at the gateway via env. |
+| `unistack-agents` | Points at the gateway via env. One folder per agent; each carries **its own virtual key**, so budgets are genuinely per agent. |
 
 ## What it gives you
 
@@ -66,8 +66,9 @@ activity?"*. `UniStackSecrets` subclasses it, reuses its ~200 `detect_secrets` p
 records the finding. It stores the secret's **type and count, never its value**: an audit log
 that quotes the credential it just redacted has leaked it into a second store.
 
-**`unistack-no-code-exec` is the one domain-dependent choice here.** A *coding* agent must drop
-it from `_BLOCKING` in `unistack_security.py` — its normal traffic is exactly what this blocks.
+**`unistack-no-code-exec` is the one domain-dependent choice here.** A *coding* agent's normal
+traffic is exactly what it blocks — so that agent opts out **by name**, without changing the
+rule for anyone else. See "Per-agent policy" below.
 
 **Why so few content categories.** Two reasons, and the second was measured.
 
@@ -134,12 +135,47 @@ Two properties the hook must keep, both covered by the verification below:
 - On any internal error it applies the **full** set. The worst case is a visible judge pause,
   never silently ungated agent traffic.
 
-Change the exempt models with `UNISTACK_GUARDRAIL_EXEMPT_MODELS` (default `judge-fast`); the
-resolved list is printed in the startup line so it is visible at boot rather than inferred.
+Change the exempt models with `UNISTACK_GUARDRAIL_EXEMPT_MODELS` (default
+`judge-fast,evaluator-fast`); the resolved list is printed in the startup line so it is visible
+at boot rather than inferred.
 
-> Because the judge is exempt, a **code-generating agent no longer breaks its own judge**. Such
-> an agent still needs `unistack-no-code-exec` removed from `_BLOCKING`, since its own traffic
-> is what that rule blocks.
+### Per-agent policy — the virtual key is the unit
+
+`unistack-agents` holds one folder per agent, and everything agent-specific lives in it. **The
+gateway is the one place that cannot follow that rule literally**, and it is worth being precise
+about why: `config.yaml` configures a single LiteLLM **process**, and one gateway serves every
+agent. Per-agent config files would mean a gateway, a Postgres and a port per agent.
+
+So per-agent differentiation attaches to the **virtual key** instead, which every agent already
+has:
+
+| Per-agent concern | Mechanism | Where it is declared |
+|---|---|---|
+| Which models it may call | key `models` | `/key/generate` |
+| What it may spend | key `max_budget` | `/key/generate` |
+| Which **blocking** guardrails it opts out of | key **alias** | `UNISTACK_GUARDRAIL_OPT_OUT` |
+
+```bash
+UNISTACK_GUARDRAIL_OPT_OUT="unistack-coding-agent:unistack-no-code-exec"
+```
+
+Comma-separated `alias:guardrail` pairs; absent means today's behaviour exactly. The resolved
+map is printed in the startup line beside the exempt models.
+
+⚠️ **The agent's identity is read from `user_api_key_dict.key_alias`, never from
+`data["metadata"]`.** LiteLLM resolves the alias from the *authenticated* key; request metadata
+is written by the caller. Keying on metadata would let any agent name another agent's alias and
+inherit its opt-outs — the same hole as a caller-supplied `data["guardrails"]`, wearing a
+different hat. (The sink reads `metadata["user_api_key_alias"]` for *reporting*, which is fine:
+a mislabelled report is not a bypassed control.)
+
+**Order is a security property.** The exempt-model check runs **first and unconditionally**, so
+no per-agent configuration can re-arm a blocking rule on the judge and take the control plane
+down. Then opt-outs. Then the full set by default — an unknown alias gets everything.
+
+> Because the judge is exempt, a **code-generating agent no longer breaks its own judge**. It
+> still needs its own `unistack-no-code-exec` opt-out, since its own traffic is what that rule
+> blocks — but that is now one env entry, not an edit to a constant shared by every agent.
 
 ### How findings get out — and the trap in it
 
@@ -216,10 +252,15 @@ Services never use the master key — they get a scoped virtual key with its own
 ```bash
 curl -s -X POST localhost:4000/key/generate \
   -H "Authorization: Bearer $LITELLM_MASTER_KEY" -H "Content-Type: application/json" \
-  -d '{"models": ["agent-primary", "judge-fast"], "max_budget": 5.0, "key_alias": "unistack-demo"}'
+  -d '{"models": ["agent-primary", "judge-fast"], "max_budget": 5.0, "key_alias": "unistack-content-marketing"}'
 ```
 
-Returns `{"key": "sk-..."}` → that is `UNISTACK_LLM_API_KEY` for `unistack-agents`.
+Returns `{"key": "sk-..."}` → that is `UNISTACK_LLM_API_KEY` in **that agent's** `.env`.
+
+⚠️ **One key per agent, always.** Budgets and the model allow-list are enforced per key, so two
+agents sharing a key share a budget — a runaway agent then spends the other's allowance, which
+is the exact failure this gateway exists to prevent. The alias is also how per-agent guardrail
+policy is addressed (above), so a shared key makes that unaddressable too.
 
 **To prove budget enforcement**, issue one with `"max_budget": 0.0000001` — the next call is
 rejected and the agent pauses for a human with "LLM budget exceeded" instead of crashing.

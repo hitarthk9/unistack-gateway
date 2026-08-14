@@ -82,11 +82,47 @@ _EXEMPT_MODELS = frozenset(
     if m.strip())
 
 
-def _select_guardrails(model: str) -> list[str]:
-    """The guardrails this request may run. Blocking rules are dropped for exempt models."""
+#: Per-AGENT relaxations of the blocking set, as `key_alias:guardrail[,key_alias:guardrail]`.
+#: e.g. UNISTACK_GUARDRAIL_OPT_OUT="unistack-coding-agent:unistack-no-code-exec"
+#:
+#: WHY THIS EXISTS: `unistack-no-code-exec` is the one domain-dependent rule in config.yaml —
+#: a CODING agent's ordinary traffic is exactly what it blocks. Before this, the only way to
+#: relax it was editing `_BLOCKING` below, which relaxes it for EVERY agent on the gateway.
+#:
+#: WHY IT IS AN ENV VAR AND NOT A PER-AGENT config.yaml: config.yaml configures one LiteLLM
+#: PROCESS, and one gateway serves every agent — per-agent copies would mean a gateway, a
+#: Postgres and a port per agent. The unit of per-agent policy here is the VIRTUAL KEY, which
+#: already carries that agent's model allow-list and budget.
+def _parse_opt_outs(raw: str) -> dict:
+    out: dict[str, set] = {}
+    for entry in raw.split(","):
+        alias, _, guardrail = entry.strip().partition(":")
+        if alias.strip() and guardrail.strip():
+            out.setdefault(alias.strip(), set()).add(guardrail.strip())
+    return out
+
+
+_OPT_OUTS = _parse_opt_outs(os.environ.get("UNISTACK_GUARDRAIL_OPT_OUT", ""))
+
+
+def _select_guardrails(model: str, key_alias: str | None = None) -> list[str]:
+    """
+    The guardrails this request may run.
+
+    Three tiers, in this order — the order is the security property:
+      1. An EXEMPT MODEL (the control plane) gets non-blocking hygiene only. Checked FIRST and
+         unconditionally, so no per-agent configuration can ever re-arm a blocking rule on the
+         judge and take the control plane down.
+      2. A key alias with declared opt-outs gets the blocking set MINUS those rules.
+      3. Everything else gets the full set — the default, unchanged.
+
+    `key_alias` is the identity of the VIRTUAL KEY that authenticated this request. See the
+    caller for why it must not come from request metadata.
+    """
     if model in _EXEMPT_MODELS:
         return list(_ALWAYS)
-    return list(_ALWAYS) + list(_BLOCKING)
+    opted_out = _OPT_OUTS.get(key_alias or "", set())
+    return list(_ALWAYS) + [g for g in _BLOCKING if g not in opted_out]
 
 
 # ── 1. A secrets guardrail that reports what it redacted ────────────────────────────────────
@@ -306,21 +342,31 @@ class SecuritySink(CustomLogger):
         # The exempt list is logged so "which models can never be blocked" is visible at boot
         # rather than inferred from code.
         logger.warning("[unistack-security] sink v%s loaded (api=%s, token=%s, "
-                       "blocking-exempt models=%s)",
+                       "blocking-exempt models=%s, per-agent opt-outs=%s)",
                        SINK_VERSION, _API_URL, "set" if _API_TOKEN else "MISSING",
-                       sorted(_EXEMPT_MODELS) or "none")
+                       sorted(_EXEMPT_MODELS) or "none",
+                       {k: sorted(v) for k, v in sorted(_OPT_OUTS.items())} or "none")
 
     async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
         """
-        Choose this request's guardrails by model.
+        Choose this request's guardrails by model, and by which agent's key is calling.
 
-        SECURITY: this **overwrites** `data["guardrails"]` unconditionally and never merges with
-        a caller-supplied value. LiteLLM checks the request body first, so honouring it would
-        let any caller opt out of every guardrail by sending `{"guardrails": []}` — the exact
-        hole LiteLLM's own design closes by refusing body-level disabling.
+        SECURITY, two parts:
+
+        1. This **overwrites** `data["guardrails"]` unconditionally and never merges with a
+           caller-supplied value. LiteLLM checks the request body first, so honouring it would
+           let any caller opt out of every guardrail by sending `{"guardrails": []}` — the exact
+           hole LiteLLM's own design closes by refusing body-level disabling.
+        2. The agent's identity is read from `user_api_key_dict`, which LiteLLM resolved from
+           the AUTHENTICATED key — never from `data["metadata"]`, which the caller writes. The
+           sink reads `metadata["user_api_key_alias"]` for reporting, and that is fine there;
+           using it HERE would let any agent name another agent's alias and inherit its
+           opt-outs, which is the same hole as (1) wearing a different hat.
         """
         try:
-            data["guardrails"] = _select_guardrails(str(data.get("model") or ""))
+            data["guardrails"] = _select_guardrails(
+                str(data.get("model") or ""),
+                getattr(user_api_key_dict, "key_alias", None))
         except Exception as exc:
             # Fail SAFE, not open: on any error apply the full set. The worst case is that a
             # judge call gets blocked (a visible pause), never that agent traffic goes ungated.
