@@ -60,13 +60,25 @@ _ALWAYS = ("unistack-secrets",)
 #: Rules that can BLOCK. Never applied to the models below.
 _BLOCKING = ("unistack-no-code-exec", "unistack-red-lines")
 
-#: The control plane. The SDK's guardrail judge evaluates untrusted agent output, so its prompt
-#: contains exactly the material a content rule is looking for — running blocking rules on it
-#: means the judge gets blocked, `evaluate_guardrail` fails CLOSED, and the activity pauses with
-#: "guardrail judge unavailable", pointing the operator at the wrong subsystem. Observed live.
-#: A blocking rule must never be able to stop the control plane.
+#: The control plane — every model whose prompt is, by design, someone else's output.
+#:
+#: `judge-fast` (the SDK's guardrail judge) and `evaluator-fast` (Langfuse's forensic quality
+#: judges) both read untrusted agent output, so their prompts contain exactly the material a
+#: content rule looks for. Two distinct failures follow if blocking rules run on them:
+#:
+#:   judge-fast     — the judge gets blocked, `evaluate_guardrail` fails CLOSED, and the activity
+#:                    pauses with "guardrail judge unavailable", pointing the operator at the
+#:                    wrong subsystem. Observed live.
+#:   evaluator-fast — the scoring call carrying the flagged output is blocked, so the observation
+#:                    is never scored. **The worse the content, the less likely it is to be
+#:                    measured** — a forensic control that goes dark precisely when there is
+#:                    something to find.
+#:
+#: A blocking rule must never be able to stop the control plane, and never be able to destroy
+#: evidence. Non-blocking hygiene (`_ALWAYS`) still applies to these models.
 _EXEMPT_MODELS = frozenset(
-    m.strip() for m in os.environ.get("UNISTACK_GUARDRAIL_EXEMPT_MODELS", "judge-fast").split(",")
+    m.strip() for m in os.environ.get("UNISTACK_GUARDRAIL_EXEMPT_MODELS",
+                                      "judge-fast,evaluator-fast").split(",")
     if m.strip())
 
 

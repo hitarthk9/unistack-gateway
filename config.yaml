@@ -20,6 +20,11 @@ model_list:
       model: anthropic/claude-haiku-4-5-20251001
       api_key: os.environ/ANTHROPIC_API_KEY
 
+  - model_name: evaluator-fast           # what Langfuse's forensic quality judges ask for
+    litellm_params:                      # (BUILD_PLAN item 6 — post-hoc scoring, never in the
+      model: anthropic/claude-haiku-4-5-20251001   # request path)
+      api_key: os.environ/ANTHROPIC_API_KEY
+
 # ── Security layer (BUILD_PLAN item 5) ────────────────────────────────────────────────────
 # DETERMINISTIC ONLY. Nothing here calls an LLM: it is all pattern and list matching, so it
 # is fast, non-flaky and auditable. The LLM security judge is item 6 and runs FORENSICALLY on
